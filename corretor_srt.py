@@ -321,7 +321,7 @@ class SubtitleCleaner:
         self.output_title = tk.StringVar()
         self.translate_enabled = tk.BooleanVar(value=False)
         self.target_language = tk.StringVar(value="pt-BR")
-        self.translation_provider = tk.StringVar(value="Argos (offline)")
+        self.translation_provider = tk.StringVar(value="Google (online)")
         self.source_path: Path | None = None
         self.progress_window: tk.Toplevel | None = None
         self.cancel_processing = threading.Event()
@@ -407,7 +407,7 @@ class SubtitleCleaner:
             controls,
             textvariable=self.translation_provider,
             values=(
-                "Argos (offline, inglês → português)",
+                "Argos (offline, português genérico)",
                 "Google (online)",
             ),
             state="readonly",
@@ -531,7 +531,11 @@ class SubtitleCleaner:
                         "O Argos offline está disponível para tradução "
                         "de inglês para português."
                     )
-                language_code = "pt" if target == "pt-BR" else target
+                language_code = (
+                    "pt"
+                    if provider == "argos" and target == "pt-BR"
+                    else target
+                )
                 corrected = translate_subtitles(
                     corrected,
                     language_code,
