@@ -1,7 +1,10 @@
 import importlib
 import json
 import re
+import shutil
 import sqlite3
+import subprocess
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -29,6 +32,92 @@ class ArgosTranslation(Protocol):
 
 
 TRANSLATION_CACHE = Path.home() / ".legendas_corretor" / "translation_cache.sqlite3"
+
+
+def convert_word_to_pdf(source_path: Path, output_path: Path) -> None:
+    if source_path.suffix.lower() not in {".doc", ".docx"}:
+        raise ValueError("Selecione um documento Word .doc ou .docx.")
+    if output_path.suffix.lower() != ".pdf":
+        raise ValueError("O arquivo de saída precisa ter a extensão .pdf.")
+    if source_path.resolve() == output_path.resolve():
+        raise ValueError("O arquivo PDF não pode substituir o documento original.")
+
+    office_command = shutil.which("soffice")
+    if office_command is None:
+        program_files = Path(r"C:\Program Files")
+        office_candidates = (
+            program_files / "LibreOffice" / "program" / "soffice.exe",
+            Path(r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"),
+        )
+        office_command = next(
+            (str(candidate) for candidate in office_candidates if candidate.is_file()),
+            None,
+        )
+
+    if office_command:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = subprocess.run(
+                [
+                    office_command,
+                    "--headless",
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    temporary_directory,
+                    str(source_path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=False,
+            )
+            generated_pdf = Path(temporary_directory) / f"{source_path.stem}.pdf"
+            if result.returncode != 0:
+                details = result.stderr.strip() or result.stdout.strip()
+                raise RuntimeError(
+                    "O LibreOffice não conseguiu converter o documento."
+                    + (f"\n{details}" if details else "")
+                )
+            if not generated_pdf.is_file():
+                raise RuntimeError(
+                    "O LibreOffice terminou sem gerar o arquivo PDF esperado."
+                )
+            shutil.copyfile(generated_pdf, output_path)
+        return
+
+    try:
+        pywintypes = importlib.import_module("pywintypes")
+        from docx2pdf import convert
+    except ImportError as error:
+        raise RuntimeError(
+            "Para converter, instale o LibreOffice ou o Microsoft Word. "
+            "Com o Word, instale também as dependências com "
+            "'python -m pip install -r requirements.txt'."
+        ) from error
+
+    com_error = getattr(pywintypes, "com_error")
+    try:
+        convert(str(source_path), str(output_path))
+    except com_error as error:
+        raise RuntimeError(
+            "O Microsoft Word não conseguiu converter o documento. "
+            "Verifique se o Word está instalado e ativado."
+        ) from error
+
+    if not output_path.is_file():
+        raise RuntimeError("A conversão terminou sem gerar o arquivo PDF.")
+
+
+def decode_subtitle_bytes(content: bytes) -> str:
+    if content.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return content.decode("utf-16")
+
+    try:
+        return content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return content.decode("cp1252")
 
 
 def get_cache_connection() -> sqlite3.Connection:
@@ -315,17 +404,30 @@ def get_argos_translation(
 class SubtitleCleaner:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Corretor de legendas SRT")
-        self.root.minsize(800, 500)
+        self.root.title("Corretor de legendas e conversor Word para PDF")
+        self.root.minsize(850, 540)
 
         self.output_title = tk.StringVar()
         self.translate_enabled = tk.BooleanVar(value=False)
         self.target_language = tk.StringVar(value="pt-BR")
         self.translation_provider = tk.StringVar(value="Google (online)")
         self.source_path: Path | None = None
+        self.word_source_path: Path | None = None
+        self.word_source_label = tk.StringVar(value="Nenhum documento selecionado")
+        self.pdf_status = tk.StringVar(value="")
         self.progress_window: tk.Toplevel | None = None
         self.cancel_processing = threading.Event()
-        self._create_widgets()
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        subtitle_tab = ttk.Frame(self.notebook, padding=8)
+        self.pdf_tab = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(subtitle_tab, text="Corretor de legendas")
+        self.notebook.add(self.pdf_tab, text="Word para PDF")
+        self._create_widgets(subtitle_tab)
+        self._create_pdf_widgets(self.pdf_tab)
 
     def _create_text_area(
         self, parent: ttk.Frame, title: str
@@ -349,12 +451,11 @@ class SubtitleCleaner:
         container.columnconfigure(0, weight=1)
         return text
 
-    def _create_widgets(self) -> None:
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-
-        main = ttk.Frame(self.root, padding=10)
+    def _create_widgets(self, parent: ttk.Frame) -> None:
+        main = ttk.Frame(parent, padding=4)
         main.grid(row=0, column=0, sticky="nsew")
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
         main.columnconfigure((0, 1), weight=1, uniform="text_areas")
         main.rowconfigure(0, weight=1)
 
@@ -422,6 +523,133 @@ class SubtitleCleaner:
         ttk.Button(
             controls, text="Salvar em Downloads", command=self.save_file
         ).grid(row=0, column=4, padx=(8, 0))
+        ttk.Button(
+            controls,
+            text="Abrir Word...",
+            command=self.open_word_from_subtitle_tab,
+        ).grid(row=1, column=4, padx=(8, 0), pady=(8, 0))
+
+    def _create_pdf_widgets(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        ttk.Label(
+            parent,
+            text=(
+                "Converta um documento Word para PDF mantendo a formatação "
+                "original."
+            ),
+            wraplength=680,
+        ).grid(row=0, column=0, sticky="w", pady=(8, 16))
+        ttk.Button(
+            parent,
+            text="Selecionar arquivo Word...",
+            command=self.open_word_file,
+        ).grid(row=1, column=0, sticky="w")
+        ttk.Label(
+            parent,
+            textvariable=self.word_source_label,
+            wraplength=680,
+        ).grid(row=2, column=0, sticky="w", pady=(10, 16))
+        self.convert_button = ttk.Button(
+            parent,
+            text="Converter para PDF...",
+            command=self.convert_word_file,
+            state="disabled",
+        )
+        self.convert_button.grid(row=3, column=0, sticky="w")
+        ttk.Label(
+            parent,
+            textvariable=self.pdf_status,
+            wraplength=680,
+        ).grid(row=4, column=0, sticky="w", pady=(12, 0))
+
+    def open_word_from_subtitle_tab(self) -> None:
+        if self.open_word_file():
+            self.notebook.select(self.pdf_tab)
+
+    def open_word_file(self) -> bool:
+        selected = filedialog.askopenfilename(
+            title="Selecionar documento Word",
+            initialdir=str(Path.home() / "Documents"),
+            filetypes=[
+                ("Documentos Word", "*.docx *.doc"),
+                ("Todos os arquivos", "*.*"),
+            ],
+        )
+        if not selected:
+            return False
+
+        self.word_source_path = Path(selected)
+        self.word_source_label.set(str(self.word_source_path))
+        self.pdf_status.set("")
+        self.convert_button.configure(state="normal")
+        return True
+
+    def convert_word_file(self) -> None:
+        if self.word_source_path is None:
+            messagebox.showinfo(
+                "Documento não selecionado",
+                "Selecione um arquivo Word antes de converter.",
+            )
+            return
+
+        source_path = self.word_source_path
+        output_path = filedialog.asksaveasfilename(
+            title="Salvar PDF",
+            initialdir=str(source_path.parent),
+            initialfile=f"{source_path.stem}.pdf",
+            defaultextension=".pdf",
+            filetypes=[("Arquivo PDF", "*.pdf")],
+        )
+        if not output_path:
+            return
+
+        destination = Path(output_path)
+        if destination.suffix.lower() != ".pdf":
+            messagebox.showerror(
+                "Formato de saída inválido",
+                "O nome do arquivo de saída precisa terminar em .pdf.",
+            )
+            return
+        if destination.exists() and not messagebox.askyesno(
+            "Substituir arquivo?",
+            f"O arquivo já existe:\n{destination}\n\n"
+            "Deseja substituir a versão anterior?",
+        ):
+            return
+
+        self.convert_button.configure(state="disabled")
+        self.pdf_status.set("Convertendo documento...")
+        worker = threading.Thread(
+            target=self._convert_word_in_background,
+            args=(source_path, destination),
+            daemon=True,
+        )
+        worker.start()
+
+    def _convert_word_in_background(
+        self, source_path: Path, output_path: Path
+    ) -> None:
+        try:
+            convert_word_to_pdf(source_path, output_path)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            self.root.after(
+                0, self._finish_word_conversion, output_path, str(error)
+            )
+            return
+
+        self.root.after(0, self._finish_word_conversion, output_path, None)
+
+    def _finish_word_conversion(
+        self, output_path: Path, error_message: str | None
+    ) -> None:
+        self.convert_button.configure(state="normal")
+        if error_message:
+            self.pdf_status.set("")
+            messagebox.showerror("Erro na conversão", error_message)
+            return
+
+        self.pdf_status.set(f"PDF criado: {output_path}")
+        messagebox.showinfo("Conversão concluída", f"PDF salvo em:\n{output_path}")
 
     def open_file(self) -> None:
         selected = filedialog.askopenfilename(
@@ -432,16 +660,25 @@ class SubtitleCleaner:
         if not selected:
             return
 
+        selected_path = Path(selected)
+        if selected_path.suffix.lower() in {".doc", ".docx"}:
+            messagebox.showinfo(
+                "Selecione a aba Word para PDF",
+                "Para converter um documento Word, abra a aba 'Word para PDF' "
+                "e clique em 'Selecionar arquivo Word...'.",
+            )
+            return
+
         try:
-            content = Path(selected).read_text(encoding="utf-8-sig")
+            content = decode_subtitle_bytes(selected_path.read_bytes())
         except (OSError, UnicodeError) as error:
             messagebox.showerror("Erro ao abrir arquivo", str(error))
             return
 
         self.input_text.delete("1.0", "end")
         self.input_text.insert("1.0", content)
-        self.output_title.set(Path(selected).stem)
-        self.source_path = Path(selected)
+        self.output_title.set(selected_path.stem)
+        self.source_path = selected_path
 
     def correct(self) -> None:
         original = self.input_text.get("1.0", "end-1c")
